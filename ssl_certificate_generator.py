@@ -1,13 +1,7 @@
-import datetime
 import socket
 import uuid
 from typing import List
 
-from cryptography import x509
-from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.x509.oid import NameOID
 from OpenSSL import crypto
 
 
@@ -29,52 +23,38 @@ def create_ca_certificate(
         [ OK ]
     """
 
-    one_day = datetime.timedelta(1, 0, 0)
-    today = datetime.datetime.today()
-    backend = default_backend()
+    passphrase = passphrase.encode()
 
-    private_key = rsa.generate_private_key(
-        public_exponent=65537,
-        key_size=2048,
-        backend=backend
-    )
+    key = crypto.PKey()
+    key.generate_key(crypto.TYPE_RSA, 2048)
 
-    public_key = private_key.public_key()
+    serialnumber= int(uuid.uuid4())
 
-    builder = x509.CertificateBuilder()
-    builder = builder.subject_name(x509.Name([
-        x509.NameAttribute(NameOID.COMMON_NAME, common_name),
-        x509.NameAttribute(NameOID.ORGANIZATION_NAME, organization_name),
-        x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, organizational_unit_name),
-    ]))
-    builder = builder.issuer_name(x509.Name([
-        x509.NameAttribute(NameOID.COMMON_NAME, common_name),
-    ]))
-    builder = builder.not_valid_before(today - one_day)
-    builder = builder.not_valid_after(today + datetime.timedelta(days=days))
-    builder = builder.serial_number(int(uuid.uuid4()))
-    builder = builder.public_key(public_key)
-    builder = builder.add_extension(
-        x509.BasicConstraints(ca=True, path_length=None),
-        critical=True,
-    )
+    cert = crypto.X509()
 
-    certificate = builder.sign(
-        private_key=private_key, algorithm=hashes.SHA256(),
-        backend=backend
-    )
+    subject = cert.get_subject()
+    subject.CN = common_name
+    subject.O = organization_name
+    subject.OU = organizational_unit_name
+
+    cert.set_version(2)
+    cert.set_issuer(subject)
+    cert.set_serial_number(serialnumber)
+    cert.gmtime_adj_notBefore(0)
+    cert.gmtime_adj_notAfter(days * 24 * 60 * 60)
+    cert.add_extensions([
+        crypto.X509Extension(b'basicConstraints', True, b'CA:TRUE, pathlen:0'),
+    ])
+    cert.set_pubkey(key)
+    cert.sign(key, 'sha512')
 
     with open('ca.key', 'wb') as fo:
-        fo.write(private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.TraditionalOpenSSL,
-            encryption_algorithm=serialization.BestAvailableEncryption(passphrase.encode())
+        fo.write(crypto.dump_privatekey(
+            crypto.FILETYPE_PEM, key, passphrase=passphrase
         ))
 
     with open('ca.crt', 'wb') as fo:
-        fo.write(certificate.public_bytes(
-            encoding=serialization.Encoding.PEM,
-        ))
+        fo.write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
 
 
 def _domain_to_record(domain: str):
@@ -101,6 +81,30 @@ def create_domain_certificate(
         Your certificates -> import -> cert.p12
         [ enter your passphrase ]
         [ OK ]
+
+    Webpack dev server:
+        devServer: {
+            server: {
+                type: 'https',
+                options: {
+                    ca: fs.readFileSync('ca.crt'),
+                    key: fs.readFileSync('cert.key'),
+                    cert: fs.readFileSync('cert.crt'),
+                    passphrase: ...your passphrase...,
+                },
+            }
+        }
+
+    Nginx:
+        http {
+            server {
+                listen 443 ssl;
+
+                ssl_certificate cert.crt;
+                ssl_certificate_key cert.key;
+            }
+        }
+
     """
 
     passphrase = passphrase.encode()
@@ -115,12 +119,14 @@ def create_domain_certificate(
             passphrase=passphrase)
 
     cert_req = crypto.X509Req()
-    cert_req.get_subject().C = C
-    cert_req.get_subject().ST = ST
-    cert_req.get_subject().L = L
-    cert_req.get_subject().O = O
-    cert_req.get_subject().CN = CN
-    cert_req.get_subject().emailAddress = email_address
+
+    subject = cert_req.get_subject()
+    subject.C = C
+    subject.ST = ST
+    subject.L = L
+    subject.O = O
+    subject.CN = CN
+    subject.emailAddress = email_address
 
     key = crypto.PKey()
     key.generate_key(crypto.TYPE_RSA, 2048)
@@ -130,7 +136,7 @@ def create_domain_certificate(
     cert.gmtime_adj_notBefore(0)
     cert.gmtime_adj_notAfter(days * 24 * 60 * 60)
     cert.set_issuer(ca_cert.get_subject())
-    cert.set_subject(cert_req.get_subject())
+    cert.set_subject(subject)
     cert.add_extensions([
         crypto.X509Extension(
             b'subjectAltName', False,
@@ -143,11 +149,11 @@ def create_domain_certificate(
     cert.set_pubkey(key)
     cert.sign(ca_key, 'sha256')
 
-    with open('cert.crt', 'wb') as f:
-        f.write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
+    with open('cert.crt', 'wb') as fo:
+        fo.write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
 
-    with open('cert.key', 'wb') as f:
-        f.write(crypto.dump_privatekey(crypto.FILETYPE_PEM, key))
+    with open('cert.key', 'wb') as fo:
+        fo.write(crypto.dump_privatekey(crypto.FILETYPE_PEM, key))
 
     # Generate importable cert for browser
     pkcs = crypto.PKCS12()
@@ -157,8 +163,15 @@ def create_domain_certificate(
         file.write(pkcs.export(passphrase=passphrase))
 
 
-create_ca_certificate('develop')
-create_domain_certificate('develop', [
-    '192.168.50.7',
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+    s.connect(('8.8.8.8', 0))
+    develop_ip = s.getsockname()[0]
+
+passphrase = 'develop'
+
+create_ca_certificate(passphrase)
+create_domain_certificate(passphrase, domains=[
+    develop_ip,
+    '127.0.0.1',
     'develop.local'
 ])
